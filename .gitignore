@@ -1,0 +1,16 @@
+.DS_Store
+target/
+.mvn/wrapper/maven-wrapper.jar
+.idea/
+*.iml
+.venv/
+__pycache__/
+.pytest_cache/
+.env
+results/**/*
+!results/.gitkeep
+!results/baseline/
+!results/baseline/.gitkeep
+!results/resilient/
+!results/resilient/.gitkeep
+

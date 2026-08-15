@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://research.local/schemas/cart.schema.json",
+  "title": "Cart",
+  "type": "object",
+  "required": ["cartId", "customerId", "status", "items"],
+  "properties": {
+    "cartId": { "type": "string" },
+    "customerId": { "type": "string" },
+    "status": { "type": "string", "enum": ["OPEN", "CHECKING_OUT", "ORDERED", "ABANDONED"] },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["sku", "quantity"],
+        "properties": {
+          "sku": { "type": "string" },
+          "quantity": { "type": "integer", "minimum": 1 }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}
+

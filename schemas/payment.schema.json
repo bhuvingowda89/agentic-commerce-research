@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://research.local/schemas/payment.schema.json",
+  "title": "Payment",
+  "type": "object",
+  "required": ["paymentId", "orderId", "amount", "currency", "status"],
+  "properties": {
+    "paymentId": { "type": "string" },
+    "orderId": { "type": "string" },
+    "amount": { "type": "number", "minimum": 0 },
+    "currency": { "type": "string", "minLength": 3, "maxLength": 3 },
+    "status": { "type": "string", "enum": ["AUTHORIZED", "DECLINED", "CAPTURED", "FAILED"] }
+  },
+  "additionalProperties": false
+}
+

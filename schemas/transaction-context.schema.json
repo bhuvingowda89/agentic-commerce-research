@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://research.local/schemas/transaction-context.schema.json",
+  "title": "TransactionContext",
+  "type": "object",
+  "required": ["transactionId", "workflowName", "state", "createdAt"],
+  "properties": {
+    "transactionId": { "type": "string" },
+    "workflowName": { "type": "string" },
+    "state": {
+      "type": "string",
+      "enum": ["STARTED", "CART_CREATED", "ORDER_CREATED", "PAYMENT_AUTHORIZED", "COMPLETED", "FAILED"]
+    },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "updatedAt": { "type": "string", "format": "date-time" }
+  },
+  "additionalProperties": false
+}
+

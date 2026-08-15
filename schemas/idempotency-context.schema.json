@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://research.local/schemas/idempotency-context.schema.json",
+  "title": "IdempotencyContext",
+  "type": "object",
+  "required": ["idempotencyKey", "operation", "requestHash"],
+  "properties": {
+    "idempotencyKey": { "type": "string" },
+    "operation": { "type": "string" },
+    "requestHash": { "type": "string" },
+    "resultReference": { "type": "string" },
+    "status": { "type": "string", "enum": ["NEW", "IN_PROGRESS", "SUCCEEDED", "FAILED"] }
+  },
+  "additionalProperties": false
+}
+

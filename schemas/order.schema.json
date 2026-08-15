@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://research.local/schemas/order.schema.json",
+  "title": "Order",
+  "type": "object",
+  "required": ["orderId", "cartId", "customerId", "status"],
+  "properties": {
+    "orderId": { "type": "string" },
+    "cartId": { "type": "string" },
+    "customerId": { "type": "string" },
+    "status": { "type": "string", "enum": ["CREATED", "PAYMENT_PENDING", "PAID", "FAILED", "CANCELLED"] }
+  },
+  "additionalProperties": false
+}
+
