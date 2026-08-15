@@ -1,0 +1,11 @@
+{
+  "aggregatePath": "results/phase_a_services_final/phase_a_aggregate_by_scenario_mode.csv",
+  "backend": "services",
+  "failedRunLogPreservedAt": "results/phase_a_services/phase_a_failed_runs.jsonl",
+  "generatedAt": "2026-08-14T18:53:20.007128+00:00",
+  "phase": "A",
+  "primaryRoot": "results/phase_a_services",
+  "rerunRoot": "results/phase_a_services_reruns",
+  "summaryCount": 130,
+  "summaryPath": "results/phase_a_services_final/phase_a_summary.csv"
+}

@@ -1,0 +1,40 @@
+{
+  "aggregatePath": "results/phase_b1_services/final/phase_b1_aggregate_by_scenario_mode.csv",
+  "backend": "services",
+  "comparisonPath": "results/phase_b1_services/final/phase_b1_comparison.csv",
+  "completedRuns": 150,
+  "concurrency": 50,
+  "databaseIsolation": "PostgreSQL tables orchestrator_transactions, carts, orders, payments are truncated with restart identity before each independent repetition/configuration.",
+  "endedAt": "2026-08-14T23:53:02.576399+00:00",
+  "environment": {
+    "cpu": "arm",
+    "cpuCoreCount": 10,
+    "dockerComposeVersion": "Docker Compose version 5.0.1",
+    "dockerVersion": "Docker version 29.1.3, build f52814d454",
+    "javaVersion": "openjdk version \"21.0.9\" 2025-10-21 | OpenJDK Runtime Environment Homebrew (build 21.0.9) | OpenJDK 64-Bit Server VM Homebrew (build 21.0.9, mixed mode, sharing)",
+    "os": "macOS-15.5-arm64-arm-64bit",
+    "postgresqlVersion": "PostgreSQL 16.15 on aarch64-unknown-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit",
+    "pythonVersion": "3.9.6",
+    "ramBytes": 17179869184,
+    "servicePorts": "orchestrator=8080, cart=8081, order=8082, payment=8083",
+    "serviceTopology": "workload runner -> orchestrator -> cart-service/order-service/payment-simulator -> PostgreSQL",
+    "springBootVersion": "3.3.6"
+  },
+  "expectedRuns": 150,
+  "failedRunLog": "results/phase_b1_services/final/phase_b1_failed_runs.jsonl",
+  "modes": [
+    "baseline",
+    "resilient"
+  ],
+  "outputRootSizeBytes": 2432094495,
+  "phase": "B1",
+  "rawRoot": "results/phase_b1_services/raw",
+  "reconciliationWindowMs": "2000",
+  "repetitions": 5,
+  "runtimeSeconds": 6032.361121,
+  "scenarioRateCells": 15,
+  "seedMapping": "For each scenario/rate cell, scenario_seed = base_seed + cell_index * 10000; repetition seed = scenario_seed + repetition - 1; BASELINE and RESILIENT share the same seed for matching cell/repetition.",
+  "startedAt": "2026-08-14T22:12:30.215278+00:00",
+  "summaryPath": "results/phase_b1_services/final/phase_b1_summary.csv",
+  "transactionsPerRun": 10000
+}
