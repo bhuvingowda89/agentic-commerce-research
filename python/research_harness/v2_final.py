@@ -68,9 +68,9 @@ PRIMARY_CELLS = [
     Cell("P13", "primary", "C1", "f12-compensation-failure-retry", 0.10, 50, 2000, 8, "C6", "RQ1", "H4", "invariantViolationRate", "No-compensation comparator for permanent payment failure after order."),
     Cell("P14", "primary", "C6", "f12-compensation-failure-retry", 0.10, 50, 2000, 8, "C1/C8", "RQ1/RQ4", "H4/H6", "compensationRate", "Compensation preserves invariants after permanent downstream failure."),
     Cell("P15", "primary", "C8", "f12-compensation-failure-retry", 0.10, 50, 2000, 8, "C6", "RQ4", "H6", "throughputTransactionsPerSecond", "Full-bundle compensation behavior and cost."),
-    Cell("P16", "primary", "C2", "true-crash-after-order", 0.0, 1, 1, 10, "C7", "RQ3", "H5", "recoveryCompletedRate", "Durable coordinator state without restart recovery under uniqueness constraint."),
-    Cell("P17", "primary", "C7", "true-crash-after-order", 0.0, 1, 1, 10, "C2/C8", "RQ3", "H5", "recoveryCompletedRate", "Restart recovery on durable state after SIGKILL/restart."),
-    Cell("P18", "primary", "C8", "true-crash-after-order", 0.0, 1, 1, 10, "C7", "RQ3/RQ4", "H5/H6", "recoveryCompletedRate", "Full-bundle crash recovery and cost."),
+    Cell("P16", "primary", "C2", "true-crash-after-order", 0.0, 1, 1, 10, "C7", "RQ3", "H5", "recoveryCompletedRate", "Durable coordinator state without restart recovery under uniqueness constraint.", crash=True),
+    Cell("P17", "primary", "C7", "true-crash-after-order", 0.0, 1, 1, 10, "C2/C8", "RQ3", "H5", "recoveryCompletedRate", "Restart recovery on durable state after SIGKILL/restart.", crash=True),
+    Cell("P18", "primary", "C8", "true-crash-after-order", 0.0, 1, 1, 10, "C7", "RQ3/RQ4", "H5/H6", "recoveryCompletedRate", "Full-bundle crash recovery and cost.", crash=True),
     Cell("P19", "primary", "C0", "f0-no-failure", 0.0, 50, 2000, 8, "C1", "RQ4", "H6", "throughputTransactionsPerSecond", "Random-identity no-failure cost baseline."),
     Cell("P20", "primary", "C1", "f0-no-failure", 0.0, 50, 2000, 8, "C0/C2", "RQ4", "H6", "throughputTransactionsPerSecond", "Deterministic identity cost."),
     Cell("P21", "primary", "C2", "f0-no-failure", 0.0, 50, 2000, 8, "C1/C8", "RQ4", "H6", "throughputTransactionsPerSecond", "Durable coordinator-state cost."),
@@ -85,11 +85,13 @@ SUPPLEMENTAL_CELLS = [
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["manifest", "run-primary", "audit", "aggregate"])
+    parser.add_argument("command", choices=["manifest", "amend-manifest", "run-primary", "audit", "aggregate"])
     args = parser.parse_args()
     RESULT_ROOT.mkdir(parents=True, exist_ok=True)
     if args.command == "manifest":
         create_manifest()
+    elif args.command == "amend-manifest":
+        amend_manifest()
     elif args.command == "run-primary":
         run_primary()
     elif args.command == "aggregate":
@@ -102,6 +104,8 @@ def create_manifest() -> None:
     if (RESULT_ROOT / "campaign-manifest.json").exists():
         raise RuntimeError("manifest already exists")
     order = execution_order(PRIMARY_CELLS)
+    run_counts = counts()
+    validate_counts(run_counts)
     payload = {
         "campaignId": CAMPAIGN_ID,
         "status": "FROZEN_FINAL_PRIMARY_CAMPAIGN_NOT_YET_EXECUTED",
@@ -116,7 +120,7 @@ def create_manifest() -> None:
         "primaryCells": [cell.__dict__ for cell in PRIMARY_CELLS],
         "supplementalCells": [cell.__dict__ for cell in SUPPLEMENTAL_CELLS],
         "executionOrder": order,
-        "runCounts": counts(),
+        "runCounts": run_counts,
         "mechanismConfigurations": {name: cfg.to_dict() for name, cfg in CONFIGURATIONS.items()},
         "mechanismEvents": EVENT_TYPES,
         "invariants": ["I1 at most one successful payment per logical transaction", "I2 COMPLETED implies valid order and successful payment", "I3 at most one order per logical transaction", "I4 COMPENSATED implies no active payable order", "I5 recovery preserves transaction identity", "I6 terminal coordinator/downstream consistency"],
@@ -128,19 +132,87 @@ def create_manifest() -> None:
     digest = sha256(RESULT_ROOT / "campaign-manifest.json")
     write_json(RESULT_ROOT / "campaign-manifest.sha256.json", {"path": "results/v2/final/campaign-manifest.json", "sha256": digest})
     write_json(RESULT_ROOT / "campaign-ledger.json", [{"runId": item["runId"], "cellId": item["cellId"], "repetition": item["repetition"], "seed": item["seed"], "state": "PLANNED", "replacementFor": None, "replacementRunId": None} for item in order])
-    repro = RESULT_ROOT / "reproducibility"
-    repro.mkdir(parents=True, exist_ok=True)
-    for name in ("campaign-manifest.json", "campaign-manifest.sha256.json", "campaign-ledger.json"):
-        shutil.copy2(RESULT_ROOT / name, repro / name)
-    (repro / "README.md").write_text("Reproduce with: PYTHONPATH=python python3 -m research_harness.v2_final run-primary; then aggregate and audit. Use the commit recorded in campaign-manifest.json.\n", encoding="utf-8")
+    write_reproducibility_files(payload, digest, "campaign-manifest.json", "campaign-manifest.sha256.json")
     write_manifest_md(payload, digest)
 
 
+def amend_manifest() -> None:
+    original = RESULT_ROOT / "campaign-manifest.json"
+    if not original.exists():
+        raise RuntimeError("original manifest is required before amendment")
+    path = RESULT_ROOT / "campaign-manifest-amendment-001.json"
+    if path.exists():
+        raise RuntimeError("amendment already exists")
+    order = execution_order(PRIMARY_CELLS)
+    run_counts = counts()
+    validate_counts(run_counts)
+    payload = {
+        "amendmentId": "campaign-manifest-amendment-001",
+        "amends": "results/v2/final/campaign-manifest.json",
+        "justification": "Corrects pre-execution manifest classification error: P16-P18 are true-crash cells, not ordinary cells. No final campaign run had started.",
+        "createdAt": utc_now(),
+        "codeCommit": sh(["git", "rev-parse", "HEAD"]),
+        "branch": sh(["git", "branch", "--show-current"]),
+        "dirtyState": bool(sh(["git", "status", "--porcelain"])),
+        "dirtyStatus": sh(["git", "status", "--porcelain"]),
+        "baseSeed": BASE_SEED,
+        "seedPolicy": "seed = baseSeed + repetitionIndex - 1; same repetition index pairs comparator configs",
+        "seeds": [{"repetition": i, "seed": BASE_SEED + i - 1} for i in range(1, 11)],
+        "primaryCells": [cell.__dict__ for cell in PRIMARY_CELLS],
+        "supplementalCells": [cell.__dict__ for cell in SUPPLEMENTAL_CELLS],
+        "executionOrder": order,
+        "runCounts": run_counts,
+        "mechanismConfigurations": {name: cfg.to_dict() for name, cfg in CONFIGURATIONS.items()},
+        "mechanismEvents": EVENT_TYPES,
+        "invariants": ["I1 at most one successful payment per logical transaction", "I2 COMPLETED implies valid order and successful payment", "I3 at most one order per logical transaction", "I4 COMPENSATED implies no active payable order", "I5 recovery preserves transaction identity", "I6 terminal coordinator/downstream consistency"],
+        "analysisPolicy": "run-level units only; paired deltas by seed; descriptive aggregates now; V2.8 inference later",
+        "failedRunPolicy": "preserve all runs; classify before replacement; replacements use new IDs and same seed when appropriate",
+        "environment": capture_run_metadata("manifest-amendment-001", V2RunConfiguration("manifest", CONFIGURATIONS["C1"], FailureScenario.F0_NO_FAILURE, 0.0, 1, 1, 1, BASE_SEED, Backend.SERVICES)),
+        "originalManifestSha256": sha256(original),
+    }
+    write_json(path, payload)
+    digest = sha256(path)
+    write_json(RESULT_ROOT / "campaign-manifest-amendment-001.sha256.json", {"path": str(path), "sha256": digest})
+    write_json(RESULT_ROOT / "campaign-ledger.json", [{"runId": item["runId"], "cellId": item["cellId"], "repetition": item["repetition"], "seed": item["seed"], "state": "PLANNED", "replacementFor": None, "replacementRunId": None} for item in order])
+    write_reproducibility_files(payload, digest, "campaign-manifest-amendment-001.json", "campaign-manifest-amendment-001.sha256.json")
+    repro = RESULT_ROOT / "reproducibility"
+    for name in ("campaign-manifest.json", "campaign-manifest.sha256.json"):
+        if (RESULT_ROOT / name).exists():
+            shutil.copy2(RESULT_ROOT / name, repro / name)
+    write_manifest_md(payload, digest)
+
+
+def write_reproducibility_files(payload, digest, manifest_name, hash_name):
+    repro = RESULT_ROOT / "reproducibility"
+    repro.mkdir(parents=True, exist_ok=True)
+    write_json(RESULT_ROOT / "execution-order.json", payload["executionOrder"])
+    write_json(RESULT_ROOT / "seed-map.json", payload["seeds"])
+    write_json(RESULT_ROOT / "environment-metadata.json", payload["environment"])
+    write_json(RESULT_ROOT / "failed-run-policy.json", {"policy": payload["failedRunPolicy"]})
+    write_json(RESULT_ROOT / "code-commit.json", {"commit": payload["codeCommit"], "branch": payload["branch"]})
+    for name in (
+        manifest_name,
+        hash_name,
+        "campaign-ledger.json",
+        "execution-order.json",
+        "seed-map.json",
+        "environment-metadata.json",
+        "failed-run-policy.json",
+        "code-commit.json",
+    ):
+        shutil.copy2(RESULT_ROOT / name, repro / name)
+    (repro / "README.md").write_text(
+        "Reproduce with: PYTHONPATH=python python3 -m research_harness.v2_final run-primary; then aggregate and audit. Use the commit recorded in the effective campaign manifest.\n",
+        encoding="utf-8",
+    )
+
+
 def run_primary() -> None:
-    manifest = read_json(RESULT_ROOT / "campaign-manifest.json")
+    manifest_path = effective_manifest_path()
+    manifest = read_json(manifest_path)
     if manifest["dirtyState"] or manifest["codeCommit"] != sh(["git", "rev-parse", "HEAD"]) or sh(["git", "status", "--porcelain"]):
         raise RuntimeError("campaign requires clean working tree at frozen commit")
-    if sha256(RESULT_ROOT / "campaign-manifest.json") != read_json(RESULT_ROOT / "campaign-manifest.sha256.json")["sha256"]:
+    if sha256(manifest_path) != read_json(manifest_hash_path(manifest_path))["sha256"]:
         raise RuntimeError("manifest hash mismatch")
     controller = DockerComposeCrashController()
     controller.start()
@@ -242,14 +314,15 @@ def aggregate() -> None:
 
 
 def audit() -> None:
-    manifest = read_json(RESULT_ROOT / "campaign-manifest.json")
+    manifest_path = effective_manifest_path()
+    manifest = read_json(manifest_path)
     ledger = read_json(RESULT_ROOT / "campaign-ledger.json")
     issues = []
     planned = {row["runId"] for row in manifest["executionOrder"]}
     complete = {row["runId"] for row in ledger if row["state"] == "COMPLETED"}
     if planned != complete:
         issues.append({"type": "ledger", "missing": sorted(planned - complete), "extra": sorted(complete - planned)})
-    if sha256(RESULT_ROOT / "campaign-manifest.json") != read_json(RESULT_ROOT / "campaign-manifest.sha256.json")["sha256"]:
+    if sha256(manifest_path) != read_json(manifest_hash_path(manifest_path))["sha256"]:
         issues.append({"type": "manifest_hash"})
     for run_id in sorted(planned):
         run_dir = RESULT_ROOT / "runs" / run_id
@@ -269,7 +342,7 @@ def audit() -> None:
                 data = read_json(cm)
                 if data.get("beforeInstance") == data.get("afterInstance"):
                     issues.append({"type": "crash_instance_not_distinct", "runId": run_id})
-    write_json(RESULT_ROOT / "campaign-completeness-audit.json", {"status": "PASS" if not issues else "FAIL", "issues": issues, "checkedAt": utc_now(), "manifestHash": sha256(RESULT_ROOT / "campaign-manifest.json"), "commit": sh(["git", "rev-parse", "HEAD"])})
+    write_json(RESULT_ROOT / "campaign-completeness-audit.json", {"status": "PASS" if not issues else "FAIL", "issues": issues, "checkedAt": utc_now(), "manifestPath": str(manifest_path), "manifestHash": sha256(manifest_path), "commit": sh(["git", "rev-parse", "HEAD"])})
     repro = RESULT_ROOT / "reproducibility"
     for name in ("campaign-ledger.json", "campaign-completeness-audit.json"):
         if (RESULT_ROOT / name).exists():
@@ -293,6 +366,22 @@ def counts():
     ordinary = sum(c.repetitions for c in PRIMARY_CELLS if not c.crash)
     crash = sum(c.repetitions for c in PRIMARY_CELLS if c.crash)
     return {"primaryCells": len(PRIMARY_CELLS), "ordinaryPrimaryRuns": ordinary, "crashPrimaryRuns": crash, "totalPrimaryRuns": ordinary + crash}
+
+
+def validate_counts(run_counts):
+    if run_counts != {"primaryCells": 22, "ordinaryPrimaryRuns": 152, "crashPrimaryRuns": 30, "totalPrimaryRuns": 182}:
+        raise RuntimeError(f"unexpected final primary run counts: {run_counts}")
+
+
+def effective_manifest_path():
+    amendment = RESULT_ROOT / "campaign-manifest-amendment-001.json"
+    return amendment if amendment.exists() else RESULT_ROOT / "campaign-manifest.json"
+
+
+def manifest_hash_path(manifest_path):
+    if manifest_path.name == "campaign-manifest-amendment-001.json":
+        return RESULT_ROOT / "campaign-manifest-amendment-001.sha256.json"
+    return RESULT_ROOT / "campaign-manifest.sha256.json"
 
 
 def run_config(cell, repetition, seed):
