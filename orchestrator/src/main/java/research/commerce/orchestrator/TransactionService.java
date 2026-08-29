@@ -16,18 +16,30 @@ class TransactionService {
     private final CommerceClient commerceClient;
     private final int maxAttempts;
     private final V2CrashPointRegistry crashPointRegistry;
+    private final MechanismEventRepository mechanismEvents;
 
     @Autowired
     TransactionService(
         TransactionRepository repository,
         CommerceClient commerceClient,
         @Value("${retry.maxAttempts:3}") int maxAttempts,
-        V2CrashPointRegistry crashPointRegistry
+        V2CrashPointRegistry crashPointRegistry,
+        MechanismEventRepository mechanismEvents
     ) {
         this.repository = repository;
         this.commerceClient = commerceClient;
         this.maxAttempts = maxAttempts;
         this.crashPointRegistry = crashPointRegistry;
+        this.mechanismEvents = mechanismEvents;
+    }
+
+    TransactionService(
+        TransactionRepository repository,
+        CommerceClient commerceClient,
+        @Value("${retry.maxAttempts:3}") int maxAttempts,
+        V2CrashPointRegistry crashPointRegistry
+    ) {
+        this(repository, commerceClient, maxAttempts, crashPointRegistry, null);
     }
 
     TransactionService(
@@ -35,7 +47,7 @@ class TransactionService {
         CommerceClient commerceClient,
         @Value("${retry.maxAttempts:3}") int maxAttempts
     ) {
-        this(repository, commerceClient, maxAttempts, new V2CrashPointRegistry());
+        this(repository, commerceClient, maxAttempts, new V2CrashPointRegistry(), null);
     }
 
     TransactionRecord execute(
@@ -148,10 +160,12 @@ class TransactionService {
         if (v2Configuration != null && !v2Configuration.isBlank()) {
             policy = V2MechanismPolicy.fromConfiguration(v2Configuration);
             if (!policy.restartRecovery()) {
+                recordEvent(idempotencyKey, "unknown", "RECOVERY_FAILED", "restart_recovery", "recover_one", null, null, "disabled:" + policy.name());
                 throw new IllegalStateException("V2_RESTART_RECOVERY_DISABLED_FOR_" + policy.name());
             }
         }
         TransactionRecord record = repository.findByIdempotencyKey(idempotencyKey).orElseThrow();
+        recordEvent(record, "RECOVERY_STARTED", "restart_recovery", "recover_one", record.state(), null, null, policy);
         TransactionState previous = null;
         int attempts = 0;
         while (!isTerminal(record.state()) && record.state() != previous && attempts < maxAttempts) {
@@ -169,6 +183,16 @@ class TransactionService {
             );
             attempts++;
         }
+        recordEvent(
+            record,
+            isTerminal(record.state()) ? "RECOVERY_SUCCEEDED" : "RECOVERY_FAILED",
+            "restart_recovery",
+            "recover_one",
+            previous,
+            record.state(),
+            "attempts=" + attempts,
+            policy
+        );
         return record;
     }
 
@@ -331,6 +355,7 @@ class TransactionService {
                 RetryCounter retryCounter = new RetryCounter();
                 CartResponse cart = attemptWithPolicy(
                     "create_cart",
+                    current,
                     () -> createCartWithPolicy(current, request, headers, policy),
                     retryCounter,
                     policy
@@ -346,6 +371,7 @@ class TransactionService {
                     TransactionRecord current = record;
                     order = attemptWithPolicy(
                         "create_order",
+                        current,
                         () -> createOrderWithPolicy(current, request, headers, policy),
                         retryCounter,
                         policy
@@ -355,9 +381,18 @@ class TransactionService {
                     awaitExternalCrashIfRequested(record, v2CrashPoint, v2CrashToken);
                 } catch (ResourceAccessException ex) {
                     record = withOperationRetries(record, retryCounter.count());
+                    if (policy.lostResponseReconciliation()) {
+                        recordEvent(record, "RECONCILIATION_STARTED", "lost_response_reconciliation", "create_order", record.state(), null, rootMessage(ex), policy);
+                    }
                     if (policy.lostResponseReconciliation() && commerceClient.inspect(record.idempotencyKey()).orderCount() > 0) {
+                        recordEvent(record, "RECONCILIATION_FOUND_EFFECT", "lost_response_reconciliation", "create_order", record.state(), null, null, policy);
                         record = repository.save(withOrder(record, "order-" + record.transactionId(), recovered));
+                        recordEvent(record, "RECONCILIATION_SUCCEEDED", "lost_response_reconciliation", "create_order", TransactionState.CART_CREATED, record.state(), null, policy);
                     } else {
+                        if (policy.lostResponseReconciliation()) {
+                            recordEvent(record, "RECONCILIATION_NOT_FOUND", "lost_response_reconciliation", "create_order", record.state(), null, null, policy);
+                            recordEvent(record, "RECONCILIATION_FAILED", "lost_response_reconciliation", "create_order", record.state(), null, rootMessage(ex), policy);
+                        }
                         throw ex;
                     }
                 }
@@ -377,6 +412,7 @@ class TransactionService {
                     TransactionRecord current = record;
                     payment = attemptWithPolicy(
                         "execute_payment",
+                        current,
                         () -> executePaymentWithPolicy(current, request, headers, policy),
                         retryCounter,
                         policy
@@ -385,9 +421,18 @@ class TransactionService {
                     record = repository.save(withPayment(record, payment.paymentId(), TransactionState.PAYMENT_COMPLETED, recovered));
                 } catch (ResourceAccessException ex) {
                     record = withOperationRetries(record, retryCounter.count());
+                    if (policy.lostResponseReconciliation()) {
+                        recordEvent(record, "RECONCILIATION_STARTED", "lost_response_reconciliation", "execute_payment", record.state(), null, rootMessage(ex), policy);
+                    }
                     if (policy.lostResponseReconciliation() && commerceClient.inspect(record.idempotencyKey()).successfulPaymentCount() > 0) {
+                        recordEvent(record, "RECONCILIATION_FOUND_EFFECT", "lost_response_reconciliation", "execute_payment", record.state(), null, null, policy);
                         record = repository.save(withPayment(record, "payment-" + record.transactionId(), TransactionState.PAYMENT_COMPLETED, recovered));
+                        recordEvent(record, "RECONCILIATION_SUCCEEDED", "lost_response_reconciliation", "execute_payment", TransactionState.PAYMENT_PENDING, record.state(), null, policy);
                     } else {
+                        if (policy.lostResponseReconciliation()) {
+                            recordEvent(record, "RECONCILIATION_NOT_FOUND", "lost_response_reconciliation", "execute_payment", record.state(), null, null, policy);
+                            recordEvent(record, "RECONCILIATION_FAILED", "lost_response_reconciliation", "execute_payment", record.state(), null, rootMessage(ex), policy);
+                        }
                         throw ex;
                     }
                 }
@@ -407,13 +452,14 @@ class TransactionService {
 
     private TransactionRecord failOrCompensate(TransactionRecord record, Exception ex, boolean recovered, CommerceClient.FailureHeaders headers, V2MechanismPolicy policy) {
         if (record.orderId() != null && policy.compensation()) {
+            recordEvent(record, "COMPENSATION_STARTED", "compensation", "cancel_order", record.state(), TransactionState.COMPENSATING, rootMessage(ex), policy);
             TransactionRecord compensating = repository.save(withState(record, TransactionState.COMPENSATING, recovered));
             int retries = 0;
             while (true) {
                 try {
                     commerceClient.cancelOrder(compensating.orderId(), headers);
                     int compensationRetries = compensating.compensationRetryCount() + retries;
-                    return repository.save(new TransactionRecord(
+                    TransactionRecord compensated = repository.save(new TransactionRecord(
                         compensating.transactionId(),
                         compensating.idempotencyKey(),
                         TransactionState.COMPENSATED,
@@ -428,13 +474,17 @@ class TransactionService {
                         true,
                         compensating.duplicateDetected()
                     ));
+                    recordEvent(compensated, "COMPENSATION_SUCCEEDED", "compensation", "cancel_order", TransactionState.COMPENSATING, compensated.state(), "retries=" + retries, policy);
+                    return compensated;
                 } catch (Exception compensationFailure) {
                     retries++;
                     if (retries >= maxAttempts) {
                         break;
                     }
+                    recordEvent(compensating, "COMPENSATION_RETRY", "compensation", "cancel_order", TransactionState.COMPENSATING, TransactionState.COMPENSATING, rootMessage(compensationFailure), policy);
                 }
             }
+            recordEvent(compensating, "COMPENSATION_FAILED", "compensation", "cancel_order", TransactionState.COMPENSATING, TransactionState.COMPENSATING, "exhausted", policy);
         }
         return repository.save(new TransactionRecord(
             record.transactionId(),
@@ -459,8 +509,13 @@ class TransactionService {
         CommerceClient.FailureHeaders headers,
         V2MechanismPolicy policy
     ) {
-        if (policy.v2() && policy.idempotentSideEffectLookup() && commerceClient.inspect(record.idempotencyKey()).cartCount() > 0) {
-            return new CartResponse("cart-" + record.transactionId(), record.transactionId(), record.idempotencyKey(), request.customerId(), "OPEN", List.of());
+        if (policy.v2() && policy.idempotentSideEffectLookup()) {
+            recordEvent(record, "IDEMPOTENT_LOOKUP_ATTEMPT", "idempotent_side_effect_lookup", "create_cart", record.state(), record.state(), null, policy);
+            if (commerceClient.inspect(record.idempotencyKey()).cartCount() > 0) {
+                recordEvent(record, "IDEMPOTENT_LOOKUP_FOUND", "idempotent_side_effect_lookup", "create_cart", record.state(), record.state(), null, policy);
+                return new CartResponse("cart-" + record.transactionId(), record.transactionId(), record.idempotencyKey(), request.customerId(), "OPEN", List.of());
+            }
+            recordEvent(record, "IDEMPOTENT_LOOKUP_NOT_FOUND", "idempotent_side_effect_lookup", "create_cart", record.state(), record.state(), null, policy);
         }
         return commerceClient.createCart(record, request, headers);
     }
@@ -471,8 +526,13 @@ class TransactionService {
         CommerceClient.FailureHeaders headers,
         V2MechanismPolicy policy
     ) {
-        if (policy.v2() && policy.idempotentSideEffectLookup() && commerceClient.inspect(record.idempotencyKey()).orderCount() > 0) {
-            return new CommerceClient.OrderResponse("order-" + record.transactionId(), record.transactionId(), record.idempotencyKey(), record.cartId(), request.customerId(), "ACTIVE");
+        if (policy.v2() && policy.idempotentSideEffectLookup()) {
+            recordEvent(record, "IDEMPOTENT_LOOKUP_ATTEMPT", "idempotent_side_effect_lookup", "create_order", record.state(), record.state(), null, policy);
+            if (commerceClient.inspect(record.idempotencyKey()).orderCount() > 0) {
+                recordEvent(record, "IDEMPOTENT_LOOKUP_FOUND", "idempotent_side_effect_lookup", "create_order", record.state(), record.state(), null, policy);
+                return new CommerceClient.OrderResponse("order-" + record.transactionId(), record.transactionId(), record.idempotencyKey(), record.cartId(), request.customerId(), "ACTIVE");
+            }
+            recordEvent(record, "IDEMPOTENT_LOOKUP_NOT_FOUND", "idempotent_side_effect_lookup", "create_order", record.state(), record.state(), null, policy);
         }
         return commerceClient.createOrder(record, request, headers);
     }
@@ -483,30 +543,43 @@ class TransactionService {
         CommerceClient.FailureHeaders headers,
         V2MechanismPolicy policy
     ) {
-        if (policy.v2() && policy.idempotentSideEffectLookup() && commerceClient.inspect(record.idempotencyKey()).successfulPaymentCount() > 0) {
-            return new CommerceClient.PaymentResponse("payment-" + record.transactionId(), record.transactionId(), record.idempotencyKey(), record.orderId(), request.amount(), request.currency(), "SUCCEEDED");
+        if (policy.v2() && policy.idempotentSideEffectLookup()) {
+            recordEvent(record, "IDEMPOTENT_LOOKUP_ATTEMPT", "idempotent_side_effect_lookup", "execute_payment", record.state(), record.state(), null, policy);
+            if (commerceClient.inspect(record.idempotencyKey()).successfulPaymentCount() > 0) {
+                recordEvent(record, "IDEMPOTENT_LOOKUP_FOUND", "idempotent_side_effect_lookup", "execute_payment", record.state(), record.state(), null, policy);
+                return new CommerceClient.PaymentResponse("payment-" + record.transactionId(), record.transactionId(), record.idempotencyKey(), record.orderId(), request.amount(), request.currency(), "SUCCEEDED");
+            }
+            recordEvent(record, "IDEMPOTENT_LOOKUP_NOT_FOUND", "idempotent_side_effect_lookup", "execute_payment", record.state(), record.state(), null, policy);
         }
         return commerceClient.executePayment(record, request, headers);
     }
 
-    private <T> T attemptWithPolicy(String operationName, Operation<T> operation, RetryCounter retryCounter, V2MechanismPolicy policy) {
+    private <T> T attemptWithPolicy(String operationName, TransactionRecord record, Operation<T> operation, RetryCounter retryCounter, V2MechanismPolicy policy) {
         if (policy.boundedRetry()) {
-            return retry(operation, retryCounter);
+            return retry(operationName, record, operation, retryCounter, policy);
         }
         return operation.run();
     }
 
-    private <T> T retry(Operation<T> operation, RetryCounter retryCounter) {
+    private <T> T retry(String operationName, TransactionRecord record, Operation<T> operation, RetryCounter retryCounter, V2MechanismPolicy policy) {
         RuntimeException last = null;
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
-                return operation.run();
+                T value = operation.run();
+                if (attempt > 1) {
+                    recordEvent(record, "RETRY_SUCCEEDED", "bounded_retry", operationName, record.state(), record.state(), "attempt=" + attempt, policy);
+                }
+                return value;
             } catch (RuntimeException ex) {
                 last = ex;
                 if (attempt == maxAttempts || !isTransient(ex)) {
+                    if (attempt > 1 || isTransient(ex)) {
+                        recordEvent(record, "RETRY_EXHAUSTED", "bounded_retry", operationName, record.state(), record.state(), rootMessage(ex), policy);
+                    }
                     throw ex;
                 }
                 retryCounter.increment();
+                recordEvent(record, "RETRY_ATTEMPT", "bounded_retry", operationName, record.state(), record.state(), "nextAttempt=" + (attempt + 1), policy);
             }
         }
         throw last == null ? new IllegalStateException("operation failed") : last;
@@ -570,6 +643,38 @@ class TransactionService {
 
     private String rootMessage(Exception ex) {
         return ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
+    }
+
+    private void recordEvent(
+        TransactionRecord record,
+        String eventType,
+        String mechanism,
+        String operation,
+        TransactionState stateBefore,
+        TransactionState stateAfter,
+        String detail,
+        V2MechanismPolicy policy
+    ) {
+        if (!policy.v2()) {
+            return;
+        }
+        recordEvent(record.idempotencyKey(), record.transactionId(), eventType, mechanism, operation, stateBefore, stateAfter, detail);
+    }
+
+    private void recordEvent(
+        String idempotencyKey,
+        String transactionId,
+        String eventType,
+        String mechanism,
+        String operation,
+        TransactionState stateBefore,
+        TransactionState stateAfter,
+        String detail
+    ) {
+        if (mechanismEvents == null) {
+            return;
+        }
+        mechanismEvents.record(idempotencyKey, transactionId, eventType, mechanism, operation, stateBefore, stateAfter, detail);
     }
 
     private interface Operation<T> {

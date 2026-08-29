@@ -153,7 +153,8 @@ class V2InfrastructureTests(unittest.TestCase):
         self.assertFalse(_runner_reconciliation_enabled(CONFIGURATIONS["C0"]))
         self.assertFalse(_runner_reconciliation_enabled(CONFIGURATIONS["C1"]))
         self.assertFalse(_runner_reconciliation_enabled(CONFIGURATIONS["C3"]))
-        self.assertTrue(_runner_reconciliation_enabled(CONFIGURATIONS["C5"]))
+        self.assertFalse(_runner_reconciliation_enabled(CONFIGURATIONS["C5"]))
+        self.assertFalse(_runner_reconciliation_enabled(CONFIGURATIONS["C8"]))
 
     def test_mechanism_activations_emit_events(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -348,7 +349,7 @@ class V2InfrastructureTests(unittest.TestCase):
         controller.reset_database()
 
         command = runner.commands[0]
-        self.assertIn("truncate table orchestrator_transactions, carts, orders, payments restart identity;", command)
+        self.assertIn("truncate table orchestrator_transactions, orchestrator_mechanism_events, carts, orders, payments restart identity;", command)
         self.assertNotIn("results", " ".join(command))
 
     def test_crash_controller_preserves_separate_logs(self):

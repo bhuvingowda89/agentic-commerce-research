@@ -117,7 +117,7 @@ class DockerComposeCrashController:
         return self.config.postgres_service in status.splitlines()
 
     def reset_database(self) -> None:
-        sql = "truncate table orchestrator_transactions, carts, orders, payments restart identity;"
+        sql = "truncate table orchestrator_transactions, orchestrator_mechanism_events, carts, orders, payments restart identity;"
         self._compose(
             "exec",
             "-T",

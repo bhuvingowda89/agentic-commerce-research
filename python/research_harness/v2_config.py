@@ -124,7 +124,7 @@ CONFIGURATIONS: dict[str, V2MechanismConfiguration] = {
             Mechanism.IDEMPOTENT_SIDE_EFFECT_LOOKUP,
             Mechanism.LOST_RESPONSE_RECONCILIATION,
         }),
-        runner_reconciliation_enabled=True,
+        runner_reconciliation_enabled=False,
     ),
     "C6": V2MechanismConfiguration(
         "C6",
@@ -153,6 +153,6 @@ CONFIGURATIONS: dict[str, V2MechanismConfiguration] = {
             Mechanism.COMPENSATION,
             Mechanism.RESTART_RECOVERY,
         }),
-        runner_reconciliation_enabled=True,
+        runner_reconciliation_enabled=False,
     ),
 }

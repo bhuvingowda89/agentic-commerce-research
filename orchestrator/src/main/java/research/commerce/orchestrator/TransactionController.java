@@ -11,10 +11,16 @@ import org.springframework.web.bind.annotation.RestController;
 class TransactionController {
     private final TransactionService transactionService;
     private final TransactionRepository transactionRepository;
+    private final MechanismEventRepository mechanismEventRepository;
 
-    TransactionController(TransactionService transactionService, TransactionRepository transactionRepository) {
+    TransactionController(
+        TransactionService transactionService,
+        TransactionRepository transactionRepository,
+        MechanismEventRepository mechanismEventRepository
+    ) {
         this.transactionService = transactionService;
         this.transactionRepository = transactionRepository;
+        this.mechanismEventRepository = mechanismEventRepository;
     }
 
     @PostMapping("/transactions")
@@ -58,5 +64,13 @@ class TransactionController {
         @RequestHeader(name = "X-V2-Configuration", required = false) String v2Configuration
     ) {
         return transactionService.recoverOne(idempotencyKey, scenario, failureRate, randomSeed, v2Configuration).toResponse();
+    }
+
+    @GetMapping("/v2/mechanism-events/idempotency/{idempotencyKey}")
+    java.util.List<MechanismEventResponse> mechanismEvents(@PathVariable("idempotencyKey") String idempotencyKey) {
+        return mechanismEventRepository.findByIdempotencyKey(idempotencyKey)
+            .stream()
+            .map(MechanismEventResponse::from)
+            .toList();
     }
 }

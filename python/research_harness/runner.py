@@ -19,7 +19,7 @@ from .retry import RetryPolicy
 from .service_backend import ServiceBackendClient, ServiceBackendConfig
 from .services import CommerceServices
 from .v2_config import V2MechanismConfiguration
-from .v2_events import EventWriter
+from .v2_events import EventRecord, EventWriter
 
 
 @dataclass(frozen=True)
@@ -151,6 +151,8 @@ def run_experiment(
 
         if backend == Backend.SERVICES and _runner_reconciliation_enabled(v2_configuration):
             _reconcile_service_results(results, service_client, mode, repetition_seed, reconciliation_window_ms=2_000)
+        if backend == Backend.SERVICES and v2_event_writer is not None and v2_run_id is not None:
+            _record_service_mechanism_events(results, service_client, v2_event_writer, v2_run_id)
 
         run_ended_at = datetime.now(timezone.utc).isoformat()
         for result in results:
@@ -363,6 +365,47 @@ def _best_observed_state(attempts: list[ExperimentResult]) -> str:
 
 def _is_terminal_state(state: str | None) -> bool:
     return state in {"COMPLETED", "COMPENSATED", "FAILED"}
+
+
+def _record_service_mechanism_events(
+    results: list[ExperimentResult],
+    service_client: ServiceBackendClient,
+    event_writer: EventWriter,
+    run_id: str,
+) -> None:
+    seen_keys = set()
+    for result in results:
+        if result.idempotency_key in seen_keys:
+            continue
+        seen_keys.add(result.idempotency_key)
+        try:
+            events = service_client.mechanism_events(result.idempotency_key)
+        except Exception as exc:
+            event_writer.append(EventRecord(
+                run_id=run_id,
+                component="runner",
+                event_type="MECHANISM_EVENT_COLLECTION_FAILED",
+                logical_transaction_id=result.idempotency_key,
+                failure_type=str(exc),
+            ))
+            continue
+        for event in events:
+            event_writer.append(EventRecord(
+                run_id=run_id,
+                component="orchestrator",
+                event_type=str(event["eventType"]),
+                execution_transaction_id=event.get("transactionId"),
+                mechanism=event.get("mechanism"),
+                operation=event.get("operation"),
+                state_before=event.get("stateBefore"),
+                state_after=event.get("stateAfter"),
+                metadata={
+                    "idempotencyKey": event.get("idempotencyKey"),
+                    "detail": event.get("detail"),
+                    "sourceEventId": event.get("eventId"),
+                    "sourceCreatedAt": event.get("createdAt"),
+                },
+            ))
 
 
 def _crash_boundary(scenario: FailureScenario) -> str | None:

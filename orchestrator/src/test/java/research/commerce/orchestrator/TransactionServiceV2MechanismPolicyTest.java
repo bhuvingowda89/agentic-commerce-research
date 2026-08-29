@@ -6,6 +6,8 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.math.BigDecimal;
+import java.time.Instant;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -51,7 +53,8 @@ class TransactionServiceV2MechanismPolicyTest {
     void c3RetriesPreSideEffectTransientPaymentFailureWithoutReconciliationOrCompensation() {
         FakeCommerceClient client = new FakeCommerceClient();
         client.paymentTransientFailuresRemaining = 2;
-        TransactionService service = new TransactionService(new FakeRepository(), client, 3);
+        FakeMechanismEventRepository events = new FakeMechanismEventRepository();
+        TransactionService service = new TransactionService(new FakeRepository(), client, 3, new V2CrashPointRegistry(), events);
 
         TransactionRecord record = service.execute(request("logical-001"), "same-key", "RESILIENT", "f11-transient-payment-failure-recovery", 1.0, "7", "C3");
 
@@ -60,13 +63,16 @@ class TransactionServiceV2MechanismPolicyTest {
         assertEquals(2, record.operationRetryCount());
         assertEquals(0, client.inspectCalls);
         assertEquals(0, client.cancelCalls);
+        assertTrue(events.has("RETRY_ATTEMPT", "bounded_retry", "execute_payment"));
+        assertTrue(events.has("RETRY_SUCCEEDED", "bounded_retry", "execute_payment"));
     }
 
     @Test
     void c3RecordsRetryExhaustionWithoutReconciliationOrCompensation() {
         FakeCommerceClient client = new FakeCommerceClient();
         client.paymentTransientFailuresRemaining = 5;
-        TransactionService service = new TransactionService(new FakeRepository(), client, 3);
+        FakeMechanismEventRepository events = new FakeMechanismEventRepository();
+        TransactionService service = new TransactionService(new FakeRepository(), client, 3, new V2CrashPointRegistry(), events);
 
         TransactionRecord record = service.execute(request("logical-001"), "same-key", "RESILIENT", "f11-transient-payment-failure-recovery", 1.0, "7", "C3");
 
@@ -76,6 +82,7 @@ class TransactionServiceV2MechanismPolicyTest {
         assertEquals(0, client.inspectCalls);
         assertEquals(0, client.cancelCalls);
         assertTrue(record.failureReason().contains("TRANSIENT_PAYMENT_FAILURE"));
+        assertTrue(events.has("RETRY_EXHAUSTED", "bounded_retry", "execute_payment"));
     }
 
     @Test
@@ -110,7 +117,8 @@ class TransactionServiceV2MechanismPolicyTest {
     void c5ReconcilesPostSideEffectPaymentResponseLoss() {
         FakeCommerceClient client = new FakeCommerceClient();
         client.paymentLostResponseCreatesSideEffect = true;
-        TransactionService service = new TransactionService(new FakeRepository(), client, 3);
+        FakeMechanismEventRepository events = new FakeMechanismEventRepository();
+        TransactionService service = new TransactionService(new FakeRepository(), client, 3, new V2CrashPointRegistry(), events);
 
         TransactionRecord record = service.execute(request("logical-001"), "same-key", "RESILIENT", "f5-payment-succeeds-response-lost", 1.0, "7", "C5");
 
@@ -120,6 +128,9 @@ class TransactionServiceV2MechanismPolicyTest {
         assertTrue(client.inspectCalls >= 4);
         assertEquals(1, client.successfulPayments);
         assertEquals(0, record.operationRetryCount());
+        assertTrue(events.has("RECONCILIATION_STARTED", "lost_response_reconciliation", "execute_payment"));
+        assertTrue(events.has("RECONCILIATION_FOUND_EFFECT", "lost_response_reconciliation", "execute_payment"));
+        assertTrue(events.has("RECONCILIATION_SUCCEEDED", "lost_response_reconciliation", "execute_payment"));
     }
 
     @Test
@@ -141,7 +152,8 @@ class TransactionServiceV2MechanismPolicyTest {
         FakeCommerceClient client = new FakeCommerceClient();
         client.paymentPermanentFailure = true;
         client.cancelTransientFailuresRemaining = 1;
-        TransactionService service = new TransactionService(new FakeRepository(), client, 3);
+        FakeMechanismEventRepository events = new FakeMechanismEventRepository();
+        TransactionService service = new TransactionService(new FakeRepository(), client, 3, new V2CrashPointRegistry(), events);
 
         TransactionRecord record = service.execute(request("logical-001"), "same-key", "RESILIENT", "f12-compensation-failure-retry", 1.0, "7", "C6");
 
@@ -151,6 +163,9 @@ class TransactionServiceV2MechanismPolicyTest {
         assertEquals(1, record.compensationRetryCount());
         assertEquals(0, client.inspectCalls);
         assertEquals(1, client.paymentCalls);
+        assertTrue(events.has("COMPENSATION_STARTED", "compensation", "cancel_order"));
+        assertTrue(events.has("COMPENSATION_RETRY", "compensation", "cancel_order"));
+        assertTrue(events.has("COMPENSATION_SUCCEEDED", "compensation", "cancel_order"));
     }
 
     @Test
@@ -173,7 +188,8 @@ class TransactionServiceV2MechanismPolicyTest {
         );
         repository.record = interrupted;
         FakeCommerceClient client = new FakeCommerceClient();
-        TransactionService service = new TransactionService(repository, client, 3);
+        FakeMechanismEventRepository events = new FakeMechanismEventRepository();
+        TransactionService service = new TransactionService(repository, client, 3, new V2CrashPointRegistry(), events);
 
         TransactionRecord recovered = service.recoverOne("same-key", "f0-no-failure", 0.0, "7", "C7");
 
@@ -186,6 +202,8 @@ class TransactionServiceV2MechanismPolicyTest {
         assertEquals(0, recovered.operationRetryCount());
         assertEquals(0, recovered.compensationRetryCount());
         assertThrows(IllegalStateException.class, () -> service.recoverOne("same-key", "f0-no-failure", 0.0, "7", "C3"));
+        assertTrue(events.has("RECOVERY_STARTED", "restart_recovery", "recover_one"));
+        assertTrue(events.has("RECOVERY_SUCCEEDED", "restart_recovery", "recover_one"));
     }
 
     @Test
@@ -342,6 +360,47 @@ class TransactionServiceV2MechanismPolicyTest {
         @Override
         List<TransactionRecord> intermediateRecords() {
             return records.values().stream().filter(item -> item.state() != TransactionState.COMPLETED && item.state() != TransactionState.COMPENSATED && item.state() != TransactionState.FAILED).toList();
+        }
+    }
+
+    private static class FakeMechanismEventRepository extends MechanismEventRepository {
+        private final List<MechanismEvent> events = new ArrayList<>();
+
+        FakeMechanismEventRepository() {
+            super(null);
+        }
+
+        @Override
+        void record(
+            String idempotencyKey,
+            String transactionId,
+            String eventType,
+            String mechanism,
+            String operation,
+            TransactionState stateBefore,
+            TransactionState stateAfter,
+            String detail
+        ) {
+            events.add(new MechanismEvent(
+                events.size() + 1,
+                idempotencyKey,
+                transactionId,
+                eventType,
+                mechanism,
+                operation,
+                stateBefore == null ? null : stateBefore.name(),
+                stateAfter == null ? null : stateAfter.name(),
+                detail,
+                Instant.EPOCH
+            ));
+        }
+
+        boolean has(String eventType, String mechanism, String operation) {
+            return events.stream().anyMatch(event ->
+                event.eventType().equals(eventType)
+                    && event.mechanism().equals(mechanism)
+                    && event.operation().equals(operation)
+            );
         }
     }
 }

@@ -128,6 +128,9 @@ class ServiceBackendClient:
     def crash_point_status(self, token: str) -> dict:
         return self._get_json(f"{self.config.orchestrator_url}/v2/crash-points/{token}")
 
+    def mechanism_events(self, idempotency_key: str) -> list[dict]:
+        return self._get_json(f"{self.config.orchestrator_url}/v2/mechanism-events/idempotency/{idempotency_key}")
+
     def _headers(
         self,
         idempotency_key: str,

@@ -30,6 +30,20 @@ class TransactionSchema {
             """);
             jdbcTemplate.execute("alter table orchestrator_transactions add column if not exists operation_retry_count integer not null default 0");
             jdbcTemplate.execute("alter table orchestrator_transactions add column if not exists compensation_retry_count integer not null default 0");
+            jdbcTemplate.execute("""
+            create table if not exists orchestrator_mechanism_events (
+              event_id bigserial primary key,
+              idempotency_key text not null,
+              transaction_id text not null,
+              event_type text not null,
+              mechanism text not null,
+              operation text,
+              state_before text,
+              state_after text,
+              detail text,
+              created_at timestamptz not null default now()
+            )
+            """);
         };
     }
 }
