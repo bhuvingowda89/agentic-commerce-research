@@ -7,6 +7,7 @@ import urllib.request
 
 from .invariants import InvariantReport
 from .models import ExecutionMode, FailureScenario, TransactionRecord, TransactionRequest, TransactionState
+from .v2_config import V2MechanismConfiguration
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,7 @@ class ServiceBackendClient:
         scenario: FailureScenario,
         failure_rate: float,
         random_seed: int,
+        v2_configuration: V2MechanismConfiguration | None = None,
     ) -> tuple[TransactionRecord | None, str | None]:
         payload = {
             "logicalTransactionId": request.logical_transaction_id,
@@ -38,7 +40,7 @@ class ServiceBackendClient:
             "amount": request.amount,
             "currency": request.currency,
         }
-        headers = self._headers(request.idempotency_key, mode, scenario, failure_rate, random_seed)
+        headers = self._headers(request.idempotency_key, mode, scenario, failure_rate, random_seed, v2_configuration)
         try:
             body = self._post_json(f"{self.config.orchestrator_url}/transactions", payload, headers)
             return self._record_from_response(body), None
@@ -111,8 +113,9 @@ class ServiceBackendClient:
         scenario: FailureScenario,
         failure_rate: float,
         random_seed: int,
+        v2_configuration: V2MechanismConfiguration | None = None,
     ) -> dict[str, str]:
-        return {
+        headers = {
             "Content-Type": "application/json",
             "Idempotency-Key": idempotency_key,
             "X-Execution-Mode": mode.value.upper(),
@@ -120,6 +123,9 @@ class ServiceBackendClient:
             "X-Failure-Rate": str(failure_rate),
             "X-Random-Seed": str(random_seed),
         }
+        if v2_configuration is not None:
+            headers["X-V2-Configuration"] = v2_configuration.name
+        return headers
 
     def _post_json(self, url: str, payload: dict, headers: dict[str, str]) -> dict:
         data = json.dumps(payload).encode("utf-8")

@@ -33,10 +33,66 @@ class TransactionService {
         double failureRate,
         String randomSeed
     ) {
+        return execute(request, idempotencyKey, mode, scenario, failureRate, randomSeed, null);
+    }
+
+    TransactionRecord execute(
+        TransactionRequest request,
+        String idempotencyKey,
+        String mode,
+        String scenario,
+        double failureRate,
+        String randomSeed,
+        String v2Configuration
+    ) {
+        if (v2Configuration != null && !v2Configuration.isBlank()) {
+            return executeV2CorrectedBaseline(request, idempotencyKey, scenario, failureRate, randomSeed, v2Configuration);
+        }
         if ("BASELINE".equalsIgnoreCase(mode)) {
             return executeBaseline(request, idempotencyKey, scenario, failureRate, randomSeed);
         }
         return executeResilient(request, idempotencyKey, scenario, failureRate, randomSeed);
+    }
+
+    private TransactionRecord executeV2CorrectedBaseline(
+        TransactionRequest request,
+        String idempotencyKey,
+        String scenario,
+        double failureRate,
+        String randomSeed,
+        String v2Configuration
+    ) {
+        if (!"C0".equals(v2Configuration) && !"C1".equals(v2Configuration)) {
+            throw new IllegalArgumentException("Only v2 corrected baseline configurations C0 and C1 are supported in this phase");
+        }
+        String transactionId = "C0".equals(v2Configuration)
+            ? "tx-v2-c0-" + UUID.randomUUID()
+            : transactionIdFor(request);
+        TransactionRecord record = new TransactionRecord(
+            transactionId,
+            idempotencyKey,
+            TransactionState.STARTED,
+            null,
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            false,
+            false,
+            false
+        );
+        CommerceClient.FailureHeaders headers = new CommerceClient.FailureHeaders(scenario, failureRate, randomSeed);
+        CartResponse cart = commerceClient.createCart(record, request, headers);
+        record = withCart(record, cart.cartId());
+        CommerceClient.OrderResponse order = commerceClient.createOrder(record, request, headers);
+        record = withOrder(record, order.orderId());
+        if ("f9-orchestrator-interruption-after-order".equals(scenario)) {
+            throw new IllegalStateException("SIMULATED_ORCHESTRATOR_INTERRUPTION_AFTER_ORDER");
+        }
+        CommerceClient.PaymentResponse payment = commerceClient.executePayment(record, request, headers);
+        return withPayment(record, payment.paymentId(), TransactionState.COMPLETED);
     }
 
     List<TransactionRecord> recover(String scenario, double failureRate, String randomSeed) {

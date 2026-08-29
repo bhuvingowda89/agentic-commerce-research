@@ -14,10 +14,12 @@ from .failures import FailureConfig, FailureInjector, InjectedFailure
 from .invariants import InvariantReport, evaluate_invariants
 from .metrics import write_results, write_summary
 from .models import Backend, ExecutionMode, ExperimentResult, FailureScenario, TransactionRecord, TransactionRequest, now
-from .orchestrators import BaselineOrchestrator, ResilientOrchestrator, StateStore
+from .orchestrators import BaselineOrchestrator, ResilientOrchestrator, StateStore, V2BaselineOrchestrator
 from .retry import RetryPolicy
 from .service_backend import ServiceBackendClient, ServiceBackendConfig
 from .services import CommerceServices
+from .v2_config import V2MechanismConfiguration
+from .v2_events import EventWriter
 
 
 @dataclass(frozen=True)
@@ -50,6 +52,9 @@ def run_experiment(
     backend: Backend = Backend.SIMULATION,
     service_config: ServiceBackendConfig = ServiceBackendConfig(),
     repetition_start: int = 1,
+    v2_configuration: V2MechanismConfiguration | None = None,
+    v2_event_writer: EventWriter | None = None,
+    v2_run_id: str | None = None,
 ) -> list[ExperimentRun]:
     experiment_id = str(uuid4())
     runs = []
@@ -62,11 +67,21 @@ def run_experiment(
         id_factory = _deterministic_id_factory(mode, scenario, repetition_number)
         orchestrator = None
         if backend == Backend.SIMULATION:
-            orchestrator = (
-                BaselineOrchestrator(services, transaction_id_factory=id_factory)
-                if mode == ExecutionMode.BASELINE
-                else ResilientOrchestrator(services, state_store, RetryPolicy(), transaction_id_factory=id_factory)
-            )
+            if v2_configuration and v2_configuration.name in {"C0", "C1"}:
+                orchestrator = V2BaselineOrchestrator(
+                    services,
+                    v2_configuration,
+                    transaction_id_factory=_v2_random_id_factory(v2_configuration.name, scenario, repetition_number),
+                    event_writer=v2_event_writer,
+                    run_id=v2_run_id,
+                    scenario=scenario.value,
+                )
+            else:
+                orchestrator = (
+                    BaselineOrchestrator(services, transaction_id_factory=id_factory)
+                    if mode == ExecutionMode.BASELINE
+                    else ResilientOrchestrator(services, state_store, RetryPolicy(), transaction_id_factory=id_factory)
+                )
         key_prefix = f"{backend.value}-{mode.value}-{scenario.value}-{experiment_id}-rep-{repetition_number:04d}"
         requests = _build_workload(scenario, transactions, repetition_number, key_prefix)
         metadata = _environment_metadata()
@@ -80,7 +95,7 @@ def run_experiment(
             invariant_report = None
             if backend == Backend.SERVICES:
                 recovery_start = perf_counter()
-                record, failure_reason = service_client.execute(request, mode, scenario, failure_rate, repetition_seed)
+                record, failure_reason = service_client.execute(request, mode, scenario, failure_rate, repetition_seed, v2_configuration)
                 recovery_time_ms = (perf_counter() - recovery_start) * 1000 if record and record.recovered else 0.0
                 try:
                     invariant_report = service_client.inspect(request.idempotency_key, record)
@@ -134,7 +149,7 @@ def run_experiment(
         else:
             results = [execute_one(request) for request in requests]
 
-        if backend == Backend.SERVICES:
+        if backend == Backend.SERVICES and _runner_reconciliation_enabled(v2_configuration):
             _reconcile_service_results(results, service_client, mode, repetition_seed, reconciliation_window_ms=2_000)
 
         run_ended_at = datetime.now(timezone.utc).isoformat()
@@ -144,6 +159,12 @@ def run_experiment(
         summary_path = write_summary(results, output_dir)
         runs.append(ExperimentRun(raw_path=raw_path, summary_path=summary_path))
     return runs
+
+
+def _runner_reconciliation_enabled(v2_configuration: V2MechanismConfiguration | None) -> bool:
+    if v2_configuration is None:
+        return True
+    return v2_configuration.runner_reconciliation_enabled
 
 
 def _build_workload(
@@ -362,6 +383,18 @@ def _deterministic_id_factory(mode: ExecutionMode, scenario: FailureScenario, re
         with lock:
             counter["value"] += 1
             return f"tx-{mode.value}-{scenario.value}-r{repetition_number:04d}-{counter['value']:08d}"
+
+    return next_id
+
+
+def _v2_random_id_factory(configuration_name: str, scenario: FailureScenario, repetition_number: int):
+    lock = Lock()
+    counter = {"value": 0}
+
+    def next_id(request: TransactionRequest) -> str:
+        with lock:
+            counter["value"] += 1
+            return f"tx-v2-{configuration_name.lower()}-{scenario.value}-r{repetition_number:04d}-{counter['value']:08d}"
 
     return next_id
 
