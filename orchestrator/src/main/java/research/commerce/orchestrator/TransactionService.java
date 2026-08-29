@@ -4,6 +4,7 @@ import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.UUID;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestClientResponseException;
@@ -14,15 +15,27 @@ class TransactionService {
     private final TransactionRepository repository;
     private final CommerceClient commerceClient;
     private final int maxAttempts;
+    private final V2CrashPointRegistry crashPointRegistry;
+
+    @Autowired
+    TransactionService(
+        TransactionRepository repository,
+        CommerceClient commerceClient,
+        @Value("${retry.maxAttempts:3}") int maxAttempts,
+        V2CrashPointRegistry crashPointRegistry
+    ) {
+        this.repository = repository;
+        this.commerceClient = commerceClient;
+        this.maxAttempts = maxAttempts;
+        this.crashPointRegistry = crashPointRegistry;
+    }
 
     TransactionService(
         TransactionRepository repository,
         CommerceClient commerceClient,
         @Value("${retry.maxAttempts:3}") int maxAttempts
     ) {
-        this.repository = repository;
-        this.commerceClient = commerceClient;
-        this.maxAttempts = maxAttempts;
+        this(repository, commerceClient, maxAttempts, new V2CrashPointRegistry());
     }
 
     TransactionRecord execute(
@@ -45,13 +58,34 @@ class TransactionService {
         String randomSeed,
         String v2Configuration
     ) {
-        if (v2Configuration != null && !v2Configuration.isBlank()) {
+        return execute(request, idempotencyKey, mode, scenario, failureRate, randomSeed, v2Configuration, null, null);
+    }
+
+    TransactionRecord execute(
+        TransactionRequest request,
+        String idempotencyKey,
+        String mode,
+        String scenario,
+        double failureRate,
+        String randomSeed,
+        String v2Configuration,
+        String v2CrashPoint,
+        String v2CrashToken
+    ) {
+        if ("C0".equals(v2Configuration) || "C1".equals(v2Configuration)) {
             return executeV2CorrectedBaseline(request, idempotencyKey, scenario, failureRate, randomSeed, v2Configuration);
+        }
+        if (v2Configuration != null && !v2Configuration.isBlank() && !isSupportedDurableV2Configuration(v2Configuration)) {
+            throw new IllegalArgumentException("Unsupported v2 configuration for services backend: " + v2Configuration);
         }
         if ("BASELINE".equalsIgnoreCase(mode)) {
             return executeBaseline(request, idempotencyKey, scenario, failureRate, randomSeed);
         }
-        return executeResilient(request, idempotencyKey, scenario, failureRate, randomSeed);
+        return executeResilient(request, idempotencyKey, scenario, failureRate, randomSeed, v2CrashPoint, v2CrashToken);
+    }
+
+    private boolean isSupportedDurableV2Configuration(String v2Configuration) {
+        return "C2".equals(v2Configuration) || "C7".equals(v2Configuration) || "C8".equals(v2Configuration);
     }
 
     private TransactionRecord executeV2CorrectedBaseline(
@@ -109,6 +143,13 @@ class TransactionService {
     }
 
     TransactionRecord recoverOne(String idempotencyKey, String scenario, double failureRate, String randomSeed) {
+        return recoverOne(idempotencyKey, scenario, failureRate, randomSeed, null);
+    }
+
+    TransactionRecord recoverOne(String idempotencyKey, String scenario, double failureRate, String randomSeed, String v2Configuration) {
+        if ("C2".equals(v2Configuration)) {
+            throw new IllegalStateException("V2_RESTART_RECOVERY_DISABLED_FOR_C2");
+        }
         TransactionRecord record = repository.findByIdempotencyKey(idempotencyKey).orElseThrow();
         TransactionState previous = null;
         int attempts = 0;
@@ -168,6 +209,18 @@ class TransactionService {
         double failureRate,
         String randomSeed
     ) {
+        return executeResilient(request, idempotencyKey, scenario, failureRate, randomSeed, null, null);
+    }
+
+    private TransactionRecord executeResilient(
+        TransactionRequest request,
+        String idempotencyKey,
+        String scenario,
+        double failureRate,
+        String randomSeed,
+        String v2CrashPoint,
+        String v2CrashToken
+    ) {
         TransactionRecord existing = repository.findByIdempotencyKey(idempotencyKey).orElse(null);
         if (existing != null && isTerminal(existing.state())) {
             return new TransactionRecord(
@@ -190,7 +243,7 @@ class TransactionService {
         TransactionRecord record = existing == null
             ? repository.create(transactionIdFor(request), idempotencyKey)
             : existing;
-        return continueResilient(request, record, scenario, failureRate, randomSeed, false);
+        return continueResilient(request, record, scenario, failureRate, randomSeed, false, v2CrashPoint, v2CrashToken);
     }
 
     private String transactionIdFor(TransactionRequest request) {
@@ -207,6 +260,19 @@ class TransactionService {
         double failureRate,
         String randomSeed,
         boolean recovered
+    ) {
+        return continueResilient(request, record, scenario, failureRate, randomSeed, recovered, null, null);
+    }
+
+    private TransactionRecord continueResilient(
+        TransactionRequest request,
+        TransactionRecord record,
+        String scenario,
+        double failureRate,
+        String randomSeed,
+        boolean recovered,
+        String v2CrashPoint,
+        String v2CrashToken
     ) {
         CommerceClient.FailureHeaders headers = new CommerceClient.FailureHeaders(scenario, failureRate, randomSeed);
         try {
@@ -226,6 +292,7 @@ class TransactionService {
                     order = retry(() -> commerceClient.createOrder(current, request, headers), retryCounter);
                     record = withOperationRetries(record, retryCounter.count());
                     record = repository.save(withOrder(record, order.orderId(), recovered));
+                    awaitExternalCrashIfRequested(record, v2CrashPoint, v2CrashToken);
                 } catch (ResourceAccessException ex) {
                     CommerceClient.ServiceState state = commerceClient.inspect(record.idempotencyKey());
                     if (state.orderCount() > 0) {
@@ -347,6 +414,14 @@ class TransactionService {
 
     private boolean isTerminal(TransactionState state) {
         return state == TransactionState.COMPLETED || state == TransactionState.COMPENSATED || state == TransactionState.FAILED;
+    }
+
+    private void awaitExternalCrashIfRequested(TransactionRecord record, String v2CrashPoint, String v2CrashToken) {
+        if (!"after-order-persisted".equals(v2CrashPoint)) {
+            return;
+        }
+        crashPointRegistry.reached(v2CrashToken, v2CrashPoint, record.transactionId(), record.state().name());
+        crashPointRegistry.awaitKill(v2CrashToken);
     }
 
     private TransactionRecord withCart(TransactionRecord record, String cartId) {

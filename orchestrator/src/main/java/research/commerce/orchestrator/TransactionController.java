@@ -25,9 +25,11 @@ class TransactionController {
         @RequestHeader(name = "X-Failure-Scenario", defaultValue = "f0-no-failure") String scenario,
         @RequestHeader(name = "X-Failure-Rate", defaultValue = "0.0") double failureRate,
         @RequestHeader(name = "X-Random-Seed", defaultValue = "7") String randomSeed,
-        @RequestHeader(name = "X-V2-Configuration", required = false) String v2Configuration
+        @RequestHeader(name = "X-V2-Configuration", required = false) String v2Configuration,
+        @RequestHeader(name = "X-V2-Crash-Point", required = false) String v2CrashPoint,
+        @RequestHeader(name = "X-V2-Crash-Token", required = false) String v2CrashToken
     ) {
-        return transactionService.execute(request, idempotencyKey, mode, scenario, failureRate, randomSeed, v2Configuration).toResponse();
+        return transactionService.execute(request, idempotencyKey, mode, scenario, failureRate, randomSeed, v2Configuration, v2CrashPoint, v2CrashToken).toResponse();
     }
 
     @PostMapping("/recovery/run")
@@ -52,8 +54,9 @@ class TransactionController {
         @PathVariable("idempotencyKey") String idempotencyKey,
         @RequestHeader(name = "X-Failure-Scenario", defaultValue = "f0-no-failure") String scenario,
         @RequestHeader(name = "X-Failure-Rate", defaultValue = "0.0") double failureRate,
-        @RequestHeader(name = "X-Random-Seed", defaultValue = "7") String randomSeed
+        @RequestHeader(name = "X-Random-Seed", defaultValue = "7") String randomSeed,
+        @RequestHeader(name = "X-V2-Configuration", required = false) String v2Configuration
     ) {
-        return transactionService.recoverOne(idempotencyKey, scenario, failureRate, randomSeed).toResponse();
+        return transactionService.recoverOne(idempotencyKey, scenario, failureRate, randomSeed, v2Configuration).toResponse();
     }
 }

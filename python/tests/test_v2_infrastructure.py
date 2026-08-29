@@ -19,9 +19,11 @@ from research_harness.v2_config import (
     Mechanism,
     V2MechanismConfiguration,
 )
+from research_harness.v2_crash import DockerComposeCrashConfig, DockerComposeCrashController, FakeCommandRunner
 from research_harness.v2_events import EventRecord, EventType, EventWriter
 from research_harness.v2_invariants import evaluate_v2_invariants, evaluate_v2_logical_invariants
 from research_harness.v2_manifest import ExperimentManifest, ManifestError
+from research_harness.v2_service_observation import ServiceSideEffect, V2ServiceObservation
 
 
 class V2InfrastructureTests(unittest.TestCase):
@@ -296,6 +298,88 @@ class V2InfrastructureTests(unittest.TestCase):
             events = event_path.read_text(encoding="utf-8")
             self.assertIn("EXECUTION_IDENTITY_ASSIGNED", events)
             self.assertIn("execution_transaction_id", events)
+
+    def test_crash_controller_uses_compose_sigkill_for_orchestrator(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            event_path = Path(tmp) / "events.jsonl"
+            runner = FakeCommandRunner()
+            controller = DockerComposeCrashController(
+                DockerComposeCrashConfig(readiness_timeout_seconds=0.01, poll_interval_seconds=0.01),
+                event_writer=EventWriter(event_path),
+                run_id="run-crash",
+                command_runner=runner,
+            )
+            controller.wait_until_unavailable = lambda url: None
+
+            controller.kill_orchestrator()
+
+            command = runner.commands[0]
+            self.assertIn("kill", command)
+            self.assertIn("SIGKILL", command)
+            self.assertIn("orchestrator", command)
+            events = event_path.read_text(encoding="utf-8")
+            self.assertIn("ORCHESTRATOR_KILL_REQUESTED", events)
+            self.assertIn("ORCHESTRATOR_PROCESS_EXITED", events)
+
+    def test_crash_controller_restart_emits_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            event_path = Path(tmp) / "events.jsonl"
+            runner = FakeCommandRunner()
+            controller = DockerComposeCrashController(
+                DockerComposeCrashConfig(readiness_timeout_seconds=0.01, poll_interval_seconds=0.01),
+                event_writer=EventWriter(event_path),
+                run_id="run-crash",
+                command_runner=runner,
+            )
+            controller.wait_for_http_health = lambda url, deadline: None
+
+            controller.restart_orchestrator()
+
+            self.assertIn("--no-deps", runner.commands[0])
+            events = event_path.read_text(encoding="utf-8")
+            self.assertIn("ORCHESTRATOR_RESTART_REQUESTED", events)
+            self.assertIn("ORCHESTRATOR_RESTARTED", events)
+            self.assertIn("ORCHESTRATOR_HEALTHY", events)
+
+    def test_crash_controller_reset_targets_only_service_tables(self):
+        runner = FakeCommandRunner()
+        controller = DockerComposeCrashController(command_runner=runner)
+
+        controller.reset_database()
+
+        command = runner.commands[0]
+        self.assertIn("truncate table orchestrator_transactions, carts, orders, payments restart identity;", command)
+        self.assertNotIn("results", " ".join(command))
+
+    def test_crash_controller_preserves_separate_logs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = FakeCommandRunner()
+            controller = DockerComposeCrashController(command_runner=runner)
+
+            paths = controller.preserve_logs(Path(tmp), "pre-crash")
+
+            self.assertIn("orchestrator", paths)
+            self.assertTrue(Path(paths["orchestrator"]).name.endswith("pre-crash.log"))
+
+    def test_v2_service_observation_detects_i5_i6_state(self):
+        record = TransactionRecord("tx-1", "key-1", TransactionState.COMPLETED, order_id="order-tx-1", payment_id="payment-tx-1")
+        valid = V2ServiceObservation(
+            coordinator=record,
+            carts=(ServiceSideEffect("cart-tx-1", "tx-1", "key-1", "OPEN"),),
+            orders=(ServiceSideEffect("order-tx-1", "tx-1", "key-1", "ACTIVE"),),
+            payments=(ServiceSideEffect("payment-tx-1", "tx-1", "key-1", "SUCCEEDED"),),
+        )
+        invalid = V2ServiceObservation(
+            coordinator=record,
+            carts=(ServiceSideEffect("cart-tx-2", "tx-2", "key-1", "OPEN"),),
+            orders=(),
+            payments=(),
+        )
+
+        self.assertTrue(valid.identity_preserved())
+        self.assertTrue(valid.terminal_state_consistent())
+        self.assertFalse(invalid.identity_preserved())
+        self.assertFalse(invalid.terminal_state_consistent())
 
     def test_c0_and_c1_do_not_activate_other_mechanisms(self):
         self.assertEqual([], CONFIGURATIONS["C0"].enabled_mechanisms)

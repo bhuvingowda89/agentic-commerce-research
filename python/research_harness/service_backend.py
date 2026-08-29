@@ -31,6 +31,8 @@ class ServiceBackendClient:
         failure_rate: float,
         random_seed: int,
         v2_configuration: V2MechanismConfiguration | None = None,
+        v2_crash_point: str | None = None,
+        v2_crash_token: str | None = None,
     ) -> tuple[TransactionRecord | None, str | None]:
         payload = {
             "logicalTransactionId": request.logical_transaction_id,
@@ -41,12 +43,20 @@ class ServiceBackendClient:
             "currency": request.currency,
         }
         headers = self._headers(request.idempotency_key, mode, scenario, failure_rate, random_seed, v2_configuration)
+        if v2_crash_point:
+            headers["X-V2-Crash-Point"] = v2_crash_point
+        if v2_crash_token:
+            headers["X-V2-Crash-Token"] = v2_crash_token
         try:
             body = self._post_json(f"{self.config.orchestrator_url}/transactions", payload, headers)
             return self._record_from_response(body), None
         except urllib.error.HTTPError as ex:
-            if scenario == FailureScenario.F9_ORCHESTRATOR_INTERRUPTION_AFTER_ORDER and mode == ExecutionMode.RESILIENT:
-                return self.recover_one(request.idempotency_key, mode, random_seed)
+            if (
+                scenario == FailureScenario.F9_ORCHESTRATOR_INTERRUPTION_AFTER_ORDER
+                and mode == ExecutionMode.RESILIENT
+                and (v2_configuration is None or v2_configuration.runner_reconciliation_enabled)
+            ):
+                return self.recover_one(request.idempotency_key, mode, random_seed, v2_configuration)
             return None, f"HTTP_{ex.code}"
         except Exception as ex:
             return None, str(ex)
@@ -93,18 +103,30 @@ class ServiceBackendClient:
         except Exception:
             return None
 
-    def recover_one(self, idempotency_key: str, mode: ExecutionMode, random_seed: int) -> tuple[TransactionRecord | None, str | None]:
+    def recover_one(
+        self,
+        idempotency_key: str,
+        mode: ExecutionMode,
+        random_seed: int,
+        v2_configuration: V2MechanismConfiguration | None = None,
+    ) -> tuple[TransactionRecord | None, str | None]:
         try:
             body = self._post_json(
                 f"{self.config.orchestrator_url}/recovery/idempotency/{idempotency_key}",
                 {},
-                self._headers(idempotency_key, mode, FailureScenario.F0_NO_FAILURE, 0.0, random_seed),
+                self._headers(idempotency_key, mode, FailureScenario.F0_NO_FAILURE, 0.0, random_seed, v2_configuration),
             )
             record = self._record_from_response(body)
             record.recovered = True
             return record, None
         except Exception as ex:
             return None, str(ex)
+
+    def orchestrator_instance(self) -> dict:
+        return self._get_json(f"{self.config.orchestrator_url}/v2/instance")
+
+    def crash_point_status(self, token: str) -> dict:
+        return self._get_json(f"{self.config.orchestrator_url}/v2/crash-points/{token}")
 
     def _headers(
         self,
