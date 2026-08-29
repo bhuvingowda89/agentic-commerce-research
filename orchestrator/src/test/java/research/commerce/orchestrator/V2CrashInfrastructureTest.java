@@ -120,6 +120,11 @@ class V2CrashInfrastructureTest {
         PaymentResponse executePayment(TransactionRecord record, TransactionRequest request, FailureHeaders headers) {
             return new PaymentResponse("payment-" + record.transactionId(), record.transactionId(), record.idempotencyKey(), record.orderId(), request.amount(), request.currency(), "SUCCEEDED");
         }
+
+        @Override
+        ServiceState inspect(String idempotencyKey) {
+            return new ServiceState(0, 0, 0, 0);
+        }
     }
 
     private static class FakeRepository extends TransactionRepository {

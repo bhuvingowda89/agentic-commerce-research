@@ -75,17 +75,14 @@ class TransactionService {
         if ("C0".equals(v2Configuration) || "C1".equals(v2Configuration)) {
             return executeV2CorrectedBaseline(request, idempotencyKey, scenario, failureRate, randomSeed, v2Configuration);
         }
-        if (v2Configuration != null && !v2Configuration.isBlank() && !isSupportedDurableV2Configuration(v2Configuration)) {
-            throw new IllegalArgumentException("Unsupported v2 configuration for services backend: " + v2Configuration);
+        if (v2Configuration != null && !v2Configuration.isBlank()) {
+            V2MechanismPolicy policy = V2MechanismPolicy.fromConfiguration(v2Configuration);
+            return executeResilient(request, idempotencyKey, scenario, failureRate, randomSeed, v2CrashPoint, v2CrashToken, policy);
         }
         if ("BASELINE".equalsIgnoreCase(mode)) {
             return executeBaseline(request, idempotencyKey, scenario, failureRate, randomSeed);
         }
         return executeResilient(request, idempotencyKey, scenario, failureRate, randomSeed, v2CrashPoint, v2CrashToken);
-    }
-
-    private boolean isSupportedDurableV2Configuration(String v2Configuration) {
-        return "C2".equals(v2Configuration) || "C7".equals(v2Configuration) || "C8".equals(v2Configuration);
     }
 
     private TransactionRecord executeV2CorrectedBaseline(
@@ -147,8 +144,12 @@ class TransactionService {
     }
 
     TransactionRecord recoverOne(String idempotencyKey, String scenario, double failureRate, String randomSeed, String v2Configuration) {
-        if ("C2".equals(v2Configuration)) {
-            throw new IllegalStateException("V2_RESTART_RECOVERY_DISABLED_FOR_C2");
+        V2MechanismPolicy policy = V2MechanismPolicy.historicalResilient();
+        if (v2Configuration != null && !v2Configuration.isBlank()) {
+            policy = V2MechanismPolicy.fromConfiguration(v2Configuration);
+            if (!policy.restartRecovery()) {
+                throw new IllegalStateException("V2_RESTART_RECOVERY_DISABLED_FOR_" + policy.name());
+            }
         }
         TransactionRecord record = repository.findByIdempotencyKey(idempotencyKey).orElseThrow();
         TransactionState previous = null;
@@ -161,7 +162,10 @@ class TransactionService {
                 scenario,
                 failureRate,
                 randomSeed,
-                true
+                true,
+                null,
+                null,
+                policy
             );
             attempts++;
         }
@@ -221,8 +225,30 @@ class TransactionService {
         String v2CrashPoint,
         String v2CrashToken
     ) {
+        return executeResilient(
+            request,
+            idempotencyKey,
+            scenario,
+            failureRate,
+            randomSeed,
+            v2CrashPoint,
+            v2CrashToken,
+            V2MechanismPolicy.historicalResilient()
+        );
+    }
+
+    private TransactionRecord executeResilient(
+        TransactionRequest request,
+        String idempotencyKey,
+        String scenario,
+        double failureRate,
+        String randomSeed,
+        String v2CrashPoint,
+        String v2CrashToken,
+        V2MechanismPolicy policy
+    ) {
         TransactionRecord existing = repository.findByIdempotencyKey(idempotencyKey).orElse(null);
-        if (existing != null && isTerminal(existing.state())) {
+        if (existing != null && isTerminal(existing.state()) && policy.idempotentSideEffectLookup()) {
             return new TransactionRecord(
                 existing.transactionId(),
                 existing.idempotencyKey(),
@@ -243,7 +269,7 @@ class TransactionService {
         TransactionRecord record = existing == null
             ? repository.create(transactionIdFor(request), idempotencyKey)
             : existing;
-        return continueResilient(request, record, scenario, failureRate, randomSeed, false, v2CrashPoint, v2CrashToken);
+        return continueResilient(request, record, scenario, failureRate, randomSeed, false, v2CrashPoint, v2CrashToken, policy);
     }
 
     private String transactionIdFor(TransactionRequest request) {
@@ -274,28 +300,62 @@ class TransactionService {
         String v2CrashPoint,
         String v2CrashToken
     ) {
+        return continueResilient(
+            request,
+            record,
+            scenario,
+            failureRate,
+            randomSeed,
+            recovered,
+            v2CrashPoint,
+            v2CrashToken,
+            V2MechanismPolicy.historicalResilient()
+        );
+    }
+
+    private TransactionRecord continueResilient(
+        TransactionRequest request,
+        TransactionRecord record,
+        String scenario,
+        double failureRate,
+        String randomSeed,
+        boolean recovered,
+        String v2CrashPoint,
+        String v2CrashToken,
+        V2MechanismPolicy policy
+    ) {
         CommerceClient.FailureHeaders headers = new CommerceClient.FailureHeaders(scenario, failureRate, randomSeed);
         try {
             if (record.state() == TransactionState.STARTED) {
                 TransactionRecord current = record;
                 RetryCounter retryCounter = new RetryCounter();
-                CartResponse cart = retry(() -> commerceClient.createCart(current, request, headers), retryCounter);
+                CartResponse cart = attemptWithPolicy(
+                    "create_cart",
+                    () -> createCartWithPolicy(current, request, headers, policy),
+                    retryCounter,
+                    policy
+                );
                 record = withOperationRetries(record, retryCounter.count());
                 record = repository.save(withCart(record, cart.cartId(), recovered));
             }
 
             if (record.state() == TransactionState.CART_CREATED) {
                 CommerceClient.OrderResponse order;
+                RetryCounter retryCounter = new RetryCounter();
                 try {
                     TransactionRecord current = record;
-                    RetryCounter retryCounter = new RetryCounter();
-                    order = retry(() -> commerceClient.createOrder(current, request, headers), retryCounter);
+                    order = attemptWithPolicy(
+                        "create_order",
+                        () -> createOrderWithPolicy(current, request, headers, policy),
+                        retryCounter,
+                        policy
+                    );
                     record = withOperationRetries(record, retryCounter.count());
                     record = repository.save(withOrder(record, order.orderId(), recovered));
                     awaitExternalCrashIfRequested(record, v2CrashPoint, v2CrashToken);
                 } catch (ResourceAccessException ex) {
-                    CommerceClient.ServiceState state = commerceClient.inspect(record.idempotencyKey());
-                    if (state.orderCount() > 0) {
+                    record = withOperationRetries(record, retryCounter.count());
+                    if (policy.lostResponseReconciliation() && commerceClient.inspect(record.idempotencyKey()).orderCount() > 0) {
                         record = repository.save(withOrder(record, "order-" + record.transactionId(), recovered));
                     } else {
                         throw ex;
@@ -312,15 +372,20 @@ class TransactionService {
 
             if (record.state() == TransactionState.PAYMENT_PENDING) {
                 CommerceClient.PaymentResponse payment;
+                RetryCounter retryCounter = new RetryCounter();
                 try {
                     TransactionRecord current = record;
-                    RetryCounter retryCounter = new RetryCounter();
-                    payment = retry(() -> commerceClient.executePayment(current, request, headers), retryCounter);
+                    payment = attemptWithPolicy(
+                        "execute_payment",
+                        () -> executePaymentWithPolicy(current, request, headers, policy),
+                        retryCounter,
+                        policy
+                    );
                     record = withOperationRetries(record, retryCounter.count());
                     record = repository.save(withPayment(record, payment.paymentId(), TransactionState.PAYMENT_COMPLETED, recovered));
                 } catch (ResourceAccessException ex) {
-                    CommerceClient.ServiceState state = commerceClient.inspect(record.idempotencyKey());
-                    if (state.successfulPaymentCount() > 0) {
+                    record = withOperationRetries(record, retryCounter.count());
+                    if (policy.lostResponseReconciliation() && commerceClient.inspect(record.idempotencyKey()).successfulPaymentCount() > 0) {
                         record = repository.save(withPayment(record, "payment-" + record.transactionId(), TransactionState.PAYMENT_COMPLETED, recovered));
                     } else {
                         throw ex;
@@ -336,12 +401,12 @@ class TransactionService {
             if (rootMessage(ex).contains("SIMULATED_ORCHESTRATOR_INTERRUPTION")) {
                 throw ex;
             }
-            return failOrCompensate(record, ex, recovered, headers);
+            return failOrCompensate(record, ex, recovered, headers, policy);
         }
     }
 
-    private TransactionRecord failOrCompensate(TransactionRecord record, Exception ex, boolean recovered, CommerceClient.FailureHeaders headers) {
-        if (record.orderId() != null) {
+    private TransactionRecord failOrCompensate(TransactionRecord record, Exception ex, boolean recovered, CommerceClient.FailureHeaders headers, V2MechanismPolicy policy) {
+        if (record.orderId() != null && policy.compensation()) {
             TransactionRecord compensating = repository.save(withState(record, TransactionState.COMPENSATING, recovered));
             int retries = 0;
             while (true) {
@@ -386,6 +451,49 @@ class TransactionService {
             false,
             record.duplicateDetected()
         ));
+    }
+
+    private CartResponse createCartWithPolicy(
+        TransactionRecord record,
+        TransactionRequest request,
+        CommerceClient.FailureHeaders headers,
+        V2MechanismPolicy policy
+    ) {
+        if (policy.v2() && policy.idempotentSideEffectLookup() && commerceClient.inspect(record.idempotencyKey()).cartCount() > 0) {
+            return new CartResponse("cart-" + record.transactionId(), record.transactionId(), record.idempotencyKey(), request.customerId(), "OPEN", List.of());
+        }
+        return commerceClient.createCart(record, request, headers);
+    }
+
+    private CommerceClient.OrderResponse createOrderWithPolicy(
+        TransactionRecord record,
+        TransactionRequest request,
+        CommerceClient.FailureHeaders headers,
+        V2MechanismPolicy policy
+    ) {
+        if (policy.v2() && policy.idempotentSideEffectLookup() && commerceClient.inspect(record.idempotencyKey()).orderCount() > 0) {
+            return new CommerceClient.OrderResponse("order-" + record.transactionId(), record.transactionId(), record.idempotencyKey(), record.cartId(), request.customerId(), "ACTIVE");
+        }
+        return commerceClient.createOrder(record, request, headers);
+    }
+
+    private CommerceClient.PaymentResponse executePaymentWithPolicy(
+        TransactionRecord record,
+        TransactionRequest request,
+        CommerceClient.FailureHeaders headers,
+        V2MechanismPolicy policy
+    ) {
+        if (policy.v2() && policy.idempotentSideEffectLookup() && commerceClient.inspect(record.idempotencyKey()).successfulPaymentCount() > 0) {
+            return new CommerceClient.PaymentResponse("payment-" + record.transactionId(), record.transactionId(), record.idempotencyKey(), record.orderId(), request.amount(), request.currency(), "SUCCEEDED");
+        }
+        return commerceClient.executePayment(record, request, headers);
+    }
+
+    private <T> T attemptWithPolicy(String operationName, Operation<T> operation, RetryCounter retryCounter, V2MechanismPolicy policy) {
+        if (policy.boundedRetry()) {
+            return retry(operation, retryCounter);
+        }
+        return operation.run();
     }
 
     private <T> T retry(Operation<T> operation, RetryCounter retryCounter) {
