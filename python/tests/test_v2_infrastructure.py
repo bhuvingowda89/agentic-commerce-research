@@ -2,6 +2,7 @@ from pathlib import Path
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from research_harness.failures import FailureConfig, FailureInjector
 from research_harness.models import Backend, ExecutionMode, FailureScenario, TransactionRecord, TransactionState
@@ -24,6 +25,7 @@ from research_harness.v2_events import EventRecord, EventType, EventWriter
 from research_harness.v2_invariants import evaluate_v2_invariants, evaluate_v2_logical_invariants
 from research_harness.v2_manifest import ExperimentManifest, ManifestError
 from research_harness.v2_service_observation import ServiceSideEffect, V2ServiceObservation
+from research_harness import v2_final
 
 
 class V2InfrastructureTests(unittest.TestCase):
@@ -345,12 +347,48 @@ class V2InfrastructureTests(unittest.TestCase):
     def test_crash_controller_reset_targets_only_service_tables(self):
         runner = FakeCommandRunner()
         controller = DockerComposeCrashController(command_runner=runner)
+        controller.wait_for_http_health = lambda url, deadline: None
 
         controller.reset_database()
 
         command = runner.commands[0]
         self.assertIn("truncate table orchestrator_transactions, orchestrator_mechanism_events, carts, orders, payments restart identity;", command)
         self.assertNotIn("results", " ".join(command))
+        self.assertIn("restart", runner.commands[1])
+        self.assertIn("payment-simulator", runner.commands[1])
+
+    def test_v2_final_ordinary_runs_pass_base_seed_once_to_runner(self):
+        calls = []
+
+        class Store:
+            def create_run(self, config, run_id):
+                class Context:
+                    run_dir = Path(tempfile.mkdtemp())
+                    event_writer = None
+                return Context()
+
+        class Controller:
+            def reset_database(self):
+                pass
+
+        class Run:
+            raw_path = Path(tempfile.mkdtemp()) / "raw.jsonl"
+            summary_path = Path(tempfile.mkdtemp()) / "summary.csv"
+
+        Run.raw_path.write_text("", encoding="utf-8")
+        Run.summary_path.write_text("a\n1\n", encoding="utf-8")
+
+        def fake_run_experiment(*args, **kwargs):
+            calls.append(kwargs)
+            return [Run()]
+
+        with patch.object(v2_final, "run_experiment", fake_run_experiment), patch.object(v2_final, "preserve_logs", lambda *args: {}):
+            v2_final.run_ordinary_cell(Store(), Controller(), None, v2_final.cell_by_id("P05"), 1, 2026082900, "seed-test-rep1")
+            v2_final.run_ordinary_cell(Store(), Controller(), None, v2_final.cell_by_id("P05"), 2, 2026082901, "seed-test-rep2")
+            v2_final.run_ordinary_cell(Store(), Controller(), None, v2_final.cell_by_id("P05"), 8, 2026082907, "seed-test-rep8")
+
+        self.assertEqual([v2_final.BASE_SEED, v2_final.BASE_SEED, v2_final.BASE_SEED], [call["random_seed"] for call in calls])
+        self.assertEqual([1, 2, 8], [call["repetition_start"] for call in calls])
 
     def test_crash_controller_preserves_separate_logs(self):
         with tempfile.TemporaryDirectory() as tmp:

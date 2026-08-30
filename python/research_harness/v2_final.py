@@ -244,7 +244,7 @@ def run_primary() -> None:
 def run_ordinary_cell(store, controller, service_config, cell, repetition, seed, run_id) -> None:
     context = store.create_run(run_config(cell, repetition, seed), run_id)
     controller.reset_database()
-    runs = run_experiment(ExecutionMode.RESILIENT, FailureScenario(cell.scenario), cell.transactions, cell.concurrency, cell.failure_rate, 1, context.run_dir / "runner", random_seed=seed, backend=Backend.SERVICES, service_config=service_config, repetition_start=repetition, v2_configuration=CONFIGURATIONS[cell.config], v2_event_writer=context.event_writer, v2_run_id=run_id)
+    runs = run_experiment(ExecutionMode.RESILIENT, FailureScenario(cell.scenario), cell.transactions, cell.concurrency, cell.failure_rate, 1, context.run_dir / "runner", random_seed=BASE_SEED, backend=Backend.SERVICES, service_config=service_config, repetition_start=repetition, v2_configuration=CONFIGURATIONS[cell.config], v2_event_writer=context.event_writer, v2_run_id=run_id)
     copy(runs[0].raw_path, context.run_dir / "transactions.jsonl")
     copy(runs[0].summary_path, context.run_dir / "summary.csv")
     preserve_logs(controller, context.run_dir / "logs", "run-end")

@@ -132,6 +132,11 @@ class DockerComposeCrashController:
             "-c",
             sql,
         )
+        self._compose("restart", "payment-simulator")
+        self.wait_for_http_health(
+            "http://localhost:18083/health",
+            time.monotonic() + self.config.readiness_timeout_seconds,
+        )
 
     def preserve_logs(self, output_dir: Path, suffix: str) -> dict[str, str]:
         output_dir.mkdir(parents=True, exist_ok=True)
