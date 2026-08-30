@@ -814,3 +814,7 @@ def sh(command):
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
+
+
+if __name__ == "__main__":
+    main()
